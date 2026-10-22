@@ -41,7 +41,7 @@
 use super::consume::{repair_store_permissions, storage_gate};
 use super::review_request::{build, ExactKeys, RequestInput};
 use super::{Context, HookDirectDefer, ENVELOPE_BYTES, ESCAPE_FACTOR};
-use crate::blocked_request_mode::safe_alternative_reason;
+use crate::blocked_request_mode::safe_alternative_reason_with_retry;
 use crate::guard_store_approval_request::rewrite_approval_url;
 use crate::local_store_read::STORE_FILE_NAME;
 use guard_command::hook_responses::{pre_tool, pre_tool_review, Object};
@@ -90,7 +90,13 @@ pub(super) fn answer(
     token: &Result<String, &'static str>,
 ) -> Result<Value, HookDirectDefer> {
     let facts = facts(context, result).ok_or(HookDirectDefer::ReviewQueue)?;
-    let review_binding = crate::native_exact_action_op::review_binding_for(exact, receipt);
+    let review_binding = crate::native_exact_action_op::review_binding_for(
+        exact,
+        receipt,
+        context
+            .recorded_payload
+            .get(crate::hook_direct::EXECUTION_ENVIRONMENT_FIELD),
+    );
     let request_id = request_id().ok_or(HookDirectDefer::ReviewQueue)?;
     let input = RequestInput {
         harness: context.harness,
@@ -108,8 +114,15 @@ pub(super) fn answer(
         },
     };
     let request = build(&input, result, receipt).ok_or(HookDirectDefer::ReviewQueue)?;
-    if !facts.ask {
-        return silent(context, result, facts.oauth_source, request);
+    if !facts.ask || (review_binding.is_none() && token.is_err()) {
+        return silent(
+            context,
+            result,
+            facts.oauth_source,
+            request,
+            review_binding.is_some(),
+            token.is_ok(),
+        );
     }
     let approval_url = request
         .get("approval_url")
@@ -189,43 +202,109 @@ fn silent(
     result: &Object,
     oauth_source: &str,
     request: Value,
+    retry_reuses_approval: bool,
+    exact_action_allowable: bool,
 ) -> Result<Value, HookDirectDefer> {
     let reason = falsy_or_text(result.get("reason"), BLOCKED_REASON)?;
     let reason_code = falsy_or_text(result.get("reason_code"), "unknown")?;
-    let mut blocked = result.clone();
-    blocked.insert("decision".to_owned(), json!("deny"));
-    blocked.insert("minimum_action".to_owned(), json!("block"));
-    blocked.insert("policy_action".to_owned(), json!("block"));
-    blocked.insert(
-        "reason".to_owned(),
-        json!(safe_alternative_reason(
-            reason,
-            Some(reason_code),
-            Some(true)
-        )),
+    let reason = safe_alternative_reason_with_retry(
+        reason,
+        Some(reason_code),
+        Some(true),
+        retry_reuses_approval,
+        exact_action_allowable,
     );
-    // The block does not name the request, so it renders before the write.
-    let encoded = serde_json::to_vec(&blocked)
-        .map_err(|_| HookDirectDefer::ReviewQueue)?
-        .len()
-        + context.harness.len();
-    if encoded * ESCAPE_FACTOR + ENVELOPE_BYTES > HOOK_RENDER_MAX_BYTES {
-        return Err(HookDirectDefer::ReviewQueue);
-    }
-    let mut response = pre_tool(context.harness, &blocked);
-    response.insert("prompted".to_owned(), json!(false));
-    response.insert(
-        "blocked_request_mode".to_owned(),
-        json!(SAFE_ALTERNATIVE_MODE),
-    );
-    write(
+    // Approving a row that is neither bound to the retry nor eligible for an
+    // exact-action Always cannot let the agent run the action, so the reason
+    // does not send the user to approve it.
+    let approval_url = request
+        .get("approval_url")
+        .and_then(Value::as_str)
+        .filter(|_| retry_reuses_approval || exact_action_allowable)
+        .map(str::to_owned);
+    // The unlinked block renders before the write, so a block the resident
+    // cannot render leaves the queue to the daemon.
+    let unlinked =
+        silent_block(context.harness, result, &reason).ok_or(HookDirectDefer::ReviewQueue)?;
+    let stored_id = write(
         context,
         SILENT_WRITE_METHOD,
         oauth_source,
         request,
         Map::new(),
     )?;
-    Ok(Value::Object(response))
+    let hint = if retry_reuses_approval {
+        crate::blocked_request_mode::approval_wait_hint_for_home(
+            &stored_id,
+            context.guard_home,
+            context.home_dir,
+        )
+    } else {
+        String::new()
+    };
+    let reason = if hint.is_empty() {
+        reason
+    } else {
+        format!("{reason} {hint}")
+    };
+    // Diagnostics must not crowd the notification out of a hook protocol
+    // that drops extra fields. A compact block preserves the wait command.
+    let unlinked = silent_block(context.harness, result, &reason)
+        .or_else(|| {
+            silent_block(
+                context.harness,
+                &Map::new(),
+                &format!("HOL Guard paused this action. {hint}"),
+            )
+        })
+        .unwrap_or(unlinked);
+    // The request is queued now, so a link that cannot be added keeps the
+    // unlinked block rather than handing the hook back.
+    let linked = approval_url.and_then(|url| {
+        let url = rewrite_approval_url(&url, &stored_id);
+        let auth_token = crate::daemon_policy_authority::load_guard_daemon_auth_token(Path::new(
+            context.guard_home,
+        ));
+        let reason = crate::native_review_link::native_review_reason(
+            &canonical_harness(context.harness),
+            &reason,
+            &url,
+            auth_token.as_deref(),
+            now_micros()?,
+        )?;
+        silent_block(context.harness, result, &reason)
+    });
+    let mut blocked = linked.unwrap_or(unlinked);
+    // Extensions can watch the handle; other harnesses see the read-only wait
+    // command in their reason. Only a bound retry gets this notification.
+    if retry_reuses_approval {
+        blocked.insert(
+            "approval_resume".to_owned(),
+            json!({"request_id": stored_id, "poll_path": format!("/v1/requests/{stored_id}")}),
+        );
+    }
+    Ok(Value::Object(blocked))
+}
+
+/// The `safe-alternative` block for `reason`, or `None` when the daemon's
+/// render request could exceed its size limit.
+fn silent_block(harness: &str, result: &Object, reason: &str) -> Option<Object> {
+    let mut blocked = result.clone();
+    blocked.insert("decision".to_owned(), json!("deny"));
+    blocked.insert("minimum_action".to_owned(), json!("block"));
+    blocked.insert("policy_action".to_owned(), json!("block"));
+    blocked.insert("reason".to_owned(), json!(reason));
+    let encoded = serde_json::to_vec(&blocked).ok()?.len() + harness.len();
+    if encoded * ESCAPE_FACTOR + ENVELOPE_BYTES > HOOK_RENDER_MAX_BYTES {
+        return None;
+    }
+    let mut response = pre_tool(harness, &blocked);
+    response.insert("prompted".to_owned(), json!(false));
+    response.insert(
+        "blocked_request_mode".to_owned(),
+        json!(SAFE_ALTERNATIVE_MODE),
+    );
+    Some(response)
 }
 
 /// `str(value or fallback)` for the values the resident reproduces: a string,
